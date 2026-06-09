@@ -1,0 +1,6 @@
+obj-m += fpga_gdr.o
+
+# nvidia_p2p_* symbols come from the NVIDIA kernel module.
+NV_SRC ?= /usr/src/nvidia-570.172.08
+ccflags-y += -I$(NV_SRC)/nvidia
+KBUILD_EXTRA_SYMBOLS += $(NV_SRC)/Module.symvers

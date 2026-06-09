@@ -21,8 +21,14 @@ message(STATUS "Using XRT at ${XRT_ROOT}")
 
 add_executable(gpu_pull src/gpu_pull.cu)
 
-target_include_directories(gpu_pull PRIVATE ${XRT_ROOT}/include)
-target_link_directories(gpu_pull PRIVATE ${XRT_ROOT}/lib)
-target_link_libraries(gpu_pull PRIVATE xrt_coreutil uuid pthread)
+# Milestone B: FPGA DMAs into GPU VRAM (Phase-0 spike + full push).
+add_executable(gpu_push_spike src/gpu_push_spike.cu)
+add_executable(gpu_push src/gpu_push.cu)
+
+foreach(t gpu_pull gpu_push_spike gpu_push)
+  target_include_directories(${t} PRIVATE ${XRT_ROOT}/include)
+  target_link_directories(${t} PRIVATE ${XRT_ROOT}/lib)
+  target_link_libraries(${t} PRIVATE xrt_coreutil uuid pthread)
+endforeach()
 
 # The CUDA language links the CUDA runtime (cudart) automatically.

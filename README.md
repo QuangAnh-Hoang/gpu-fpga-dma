@@ -1,19 +1,178 @@
 # gpu-fpga-dma
 
-FPGA↔GPU data path experiments on an Alveo U55C + RTX A6000 (see per-milestone
-sections below).
+FPGA↔GPU data path experiments on an Alveo U55C + RTX A6000, building toward an
+**emulated intelligent storage device** for GNN feature gathering (see
+per-milestone sections below).
 
 - **Milestone A** — GPU pulls from FPGA HBM (GPU-initiated peer read). ~4.40 GB/s.
-- **Milestone B** — true GPUDirect RDMA: the FPGA is DMA master and writes into
-  GPU VRAM. Validated byte-for-byte; **~12.87 GB/s** (Gen3 x16 line rate) with the
-  512-bit kernel.
+- **Milestone B** — true GPUDirect RDMA: the FPGA is DMA master and writes a
+  generated pattern into GPU VRAM. Validated byte-for-byte; **~12.87 GB/s**
+  (Gen3 x16 line rate) with the 512-bit kernel.
+- **Milestone C** — a **GPU-request → FPGA-response queue pair** on top of B: the
+  GPU submits a batch of node IDs; the FPGA randomly gathers their feature rows
+  from an HBM table and streams them packed into a GPU-VRAM ring. G1 (every word
+  validated) **PASSES** across 6 access patterns; G2 sustains **~3.8 GB/s**
+  (8 Mfeat/s) per round.
+
+The most important finding of Milestone C is a **platform law** of this U55C
+shell that reshaped the whole design — see *Why rounds, not a doorbell* below.
+
+---
+
+# Milestone C — GPU-request → FPGA-response queue pair (GNN feature gather)
+
+Emulated intelligent storage device: the node-feature table lives in FPGA HBM;
+the GPU asks for a batch of node IDs; the FPGA gathers those (random-access)
+feature rows and streams them **packed** into GPU VRAM, where a GPU kernel
+consumes them. This is the realistic GNN mini-batch dataflow built on the
+Milestone B data plane.
+
+## Architecture
+
+```
+                 ┌──────────────────────── 16 MB pinned GPU-VRAM window ───────────────────┐
+   GPU           │ [0 .. 8MB) feature ring │ CQ PROG/DONE │ ... │ node-ID list (@ +9MB) │  │
+  ┌────┐ stage IDs  ▲ consume+validate          ▲ poll DONE              ▲ write IDs        │
+  │A6000│───────────┼──────────────────────────┼────────────────────────┘ (pre-launch)    │
+  └────┘            │ (all VRAM-local stores/loads on the GPU side)                        │
+                    └──────────────┬───────────────────────────────────┬───────────────────┘
+                          HOST[0] / HMSS slave bridge (PCIe, Milestone B)
+                    ┌──────────────▼───────────────────────────────────▼───────────────────┐
+   FPGA (U55C)      │ sq: bulk-read IDs once → URAM   out: stream packed rows → ring + CQ   │
+                    │ feat: random row reads ◄─────────── 14 GB static feature table (HBM)  │
+                    └──────────────────────────────────────────────────────────────────────┘
+```
+
+One **round** = one kernel launch = one batch of node IDs:
+
+1. **Request.** The GPU writes the node-ID list into the window's ID region
+   (`stage_ids`, a device kernel doing VRAM-local stores) and launches the
+   kernel with batch metadata (`batch_id`, `n_ids`, `row_beats`) as **scalar
+   arguments**.
+2. **Gather.** The FPGA bulk-reads all IDs once (`sq` port, HOST[0]) into a
+   256 KB URAM buffer, then for each ID does a random fixed-stride row read from
+   the HBM feature table (`feat` port) and streams the rows **packed and
+   sequential** into the VRAM ring (`out` port, HOST[0], the 12.9 GB/s
+   Milestone B write path). A `PROG` record follows each 256-row chunk; a `DONE`
+   record (with magic `0x600DD03E`) is written last.
+3. **Consume.** A one-block GPU `consume` kernel polls `DONE` **locally in VRAM**
+   (no PCIe), then validates every word against the deterministic feature
+   function. Requests larger than one ring (8 MB) are split into ring-capped
+   rounds.
+
+Files: kernel [hw/gnn_gather.cpp](hw/gnn_gather.cpp) + [hw/gnn_gather.cfg](hw/gnn_gather.cfg),
+shared layout [src/queue_layout.h](src/queue_layout.h), host/GPU driver
+[src/gnn_demo.cu](src/gnn_demo.cu).
+
+## Why rounds, not a doorbell (the platform law)
+
+The natural design is a *persistent* kernel that spins on a doorbell word the GPU
+updates. **It cannot work on this shell.** Established empirically with the
+`rd_probe` / `prestart` experiments:
+
+> Within a **single kernel execution**, a ULP `m_axi` master that re-reads an
+> address observes only its **first-read value**. Host/GPU/XDMA updates made
+> *after* kernel start never become visible to the kernel — on **both** the HBM
+> and the HOST[0] slave-bridge paths, at every read width. Across kernel
+> executions, everything is fresh.
+
+So in-kernel polling of externally-written memory is impossible here; a
+doorbell-driven consumer would spin forever on a stale value (it did, for many
+hours of debugging). The response: **no polling on the
+FPGA**. Metadata travels as scalar args, IDs are written *before* launch and read
+exactly once, and the host re-launches per round (~0.1 ms, amortized over the
+round). This is the single biggest structural difference from a textbook NVMe-
+style submission/completion queue, and it's a property of the stock XDMA shell,
+not the approach.
+
+## Key differences from Milestone B
+
+| | Milestone B | Milestone C |
+|---|---|---|
+| Role | one-shot DMA demo | request/response **queue pair** (rounds) |
+| FPGA→GPU data | kernel **generates** `seed+i` | **random gather** of real rows from a 14 GB HBM table |
+| GPU→FPGA path | none | FPGA **reads** the node-ID list from GPU VRAM via HOST[0] |
+| HMSS usage | writes only (`out`) | reads (`sq`) **and** writes (`out`) over the bridge |
+| Control plane | none | scalar-arg rounds + VRAM-local `DONE`/credit (no FPGA polling) |
+| HBM | unused | static feature table (banks 4–31), filled pre-session |
+
+## Build & run
+
+```bash
+# build the gather kernel (~45 min P&R)
+./hw/build_xclbin.sh gnn_gather          # -> hw/build_gnn_gather/gnn_gather.xclbin
+cmake -B build && cmake --build build -j
+./scripts/spike.sh                       # once: load fpga_gdr.ko + enable host-mem (sudo)
+./scripts/run_gnn.sh                      # G1 functionality + G2 performance
+# env knobs: N_NODES=2097152 ROW_BYTES=512 SUBMIT=gpu|host
+```
+
+## Results (this host)
+
+```
+--- G1 functionality (validate every word) ---
+  tiny         n_ids=16     x1  : PASS
+  small        n_ids=1024   x1  : PASS
+  medium       n_ids=16384  x2  : PASS
+  ring-split   n_ids=65536  x4  : PASS      (forces ring wraparound)
+  zipf-skew    n_ids=32768  x2  : PASS      (hot-node / power-law access)
+  back2back    n_ids=4096   x8  : PASS
+G1 PASSED
+
+--- G2 performance (row=512B = 128-dim fp32) ---
+n_ids    ms/round   GB/s     Mfeat/s
+1024     0.170      2.87     6.0
+4096     0.549      3.56     7.5
+16384    2.058      3.80     8.0       # 8 MB = one full ring (max round)
+```
+
+Every word validated byte-for-byte across all six patterns. Throughput grows
+with round size as fixed per-round overhead amortizes.
+
+## Bottlenecks & how to improve
+
+The round sustains **3.8 GB/s** vs the **12.9 GB/s** raw Milestone B write path —
+the gap is the cost of turning a raw DMA into a useful gather service:
+
+1. **Per-round launch overhead (~0.1–0.15 ms, fixed).** Dominates small rounds
+   (it's most of the 0.17 ms at 1024 IDs) and is unavoidable given the platform
+   law (no persistent kernel). *Lever:* **bigger rounds** — a larger ring (up to
+   the full 16 MB window, or a 64 KB-slot HMSS config for a wider window)
+   amortizes launch over more data; the trend (2.87→3.80 GB/s) shows the headroom.
+2. **Single gather engine.** Random HBM row reads feed one `read_rows`→`write_ring`
+   dataflow pipeline; at 8 MB/2.06 ms the gather, not the 12.9 GB/s streamer, is
+   the limiter. *Lever:* **parallel gather engines across HBM pseudo-channels**
+   (U55C has 32, ~460 GB/s aggregate — ~35× the PCIe need), each feeding one
+   512-bit packer. This is the highest-value change.
+3. **No overlap between phases.** ID upload, the bulk ID read, the gather, and the
+   consumer drain run serially within/around a round. *Lever:* **double-buffer** —
+   upload round *k+1*'s IDs and drain round *k* while gathering round *k*, so only
+   the gather stage is on the critical path.
+4. **Ring caps a round at 8 MB**, forcing large batches into multiple launches
+   (each paying overhead). *Lever:* larger ring + the overlap above.
+
+**Scalability levers (beyond raw speed):**
+
+- **int8 / quantized features** — the single highest-leverage change: 2–4× more
+  capacity (papers100M-scale fits) **and** 2–4× effective PCIe bandwidth, since
+  only the compressed bytes cross the link (dequantize in the GPU consume kernel).
+- **Capacity** — 14 GB usable HBM bounds the dataset; beyond that, treat HBM as a
+  hot-tier cache over host/NVMe, or quantize.
+- **Hot-node cache in GPU VRAM** — GNN sampling is power-law (the `zipf-skew`
+  trial); caching hub-node features GPU-side cuts PCIe traffic 2–5×.
+- **Request-path latency** — node-ID submission currently rides the same window;
+  its GPU→FPGA latency is small (IDs are ~1% of feature volume) but unmeasured,
+  and is the next thing to characterize for an autonomous (host-free) loop.
 
 ---
 
 # Milestone B — FPGA DMAs into GPU memory (true GDR)
 
 The FPGA becomes the DMA master and writes a known pattern straight into a
-`cudaMalloc` buffer; a GPU kernel validates it byte-for-byte.
+`cudaMalloc` buffer; a GPU kernel validates it byte-for-byte. This is the **data
+plane** that Milestone C turns into a feature-gather service — here the kernel
+*generates* the bytes; in C it *gathers* real feature rows and adds a request
+path.
 
 ### How it works
 1. An HLS kernel ([hw/gdr_write.cpp](hw/gdr_write.cpp)) has an AXI master wired to

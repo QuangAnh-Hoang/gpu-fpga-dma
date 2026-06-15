@@ -25,7 +25,12 @@ add_executable(gpu_pull src/gpu_pull.cu)
 add_executable(gpu_push_spike src/gpu_push_spike.cu)
 add_executable(gpu_push src/gpu_push.cu)
 
-foreach(t gpu_pull gpu_push_spike gpu_push)
+# Milestone C: queue-pair control plane (GPU-request -> FPGA-response).
+add_executable(bar_write_bench src/bar_write_bench.cu)
+add_executable(gnn_demo src/gnn_demo.cu)
+add_executable(rd_probe_host src/rd_probe_host.cu)
+
+foreach(t gpu_pull gpu_push_spike gpu_push bar_write_bench gnn_demo rd_probe_host)
   target_include_directories(${t} PRIVATE ${XRT_ROOT}/include)
   target_link_directories(${t} PRIVATE ${XRT_ROOT}/lib)
   target_link_libraries(${t} PRIVATE xrt_coreutil uuid pthread)

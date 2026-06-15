@@ -19,7 +19,8 @@ CMakeUserPresets.json
 #cmake-build-*
 
 build/
-hw/build/
+hw/build*/
 hw/*.log
 
+*.cmd
 *.xclbin

@@ -7,8 +7,8 @@ source /tools/Xilinx/Vitis/2024.1/settings64.sh
 
 HW_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLATFORM=xilinx_u55c_gen3x16_xdma_3_202210_1
-KERNEL=gdr_write
-BUILD="${HW_DIR}/build"
+KERNEL="${1:-gdr_write}"
+BUILD="${HW_DIR}/build_${KERNEL}"
 mkdir -p "$BUILD"
 cd "$BUILD"
 

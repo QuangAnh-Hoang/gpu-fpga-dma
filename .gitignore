@@ -1,15 +1,35 @@
-CMakeLists.txt.user
-CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-CTestTestfile.cmake
-_deps
-CMakeUserPresets.json
+# ---- build outputs / generated artifacts ----
+build/
+sw/obj/
+# Vitis / Vivado HW build
+hw/hw/
+hw/hw_emu/
+hw/obj/
+hw/obj.*/
+hw/.ipcache/
+hw/.Xil/
+hw/_x/
+*.bo
+*.jou
+*.log
+vivado*.backup.*
+xilinx:*
+.run/
+# Bluespec / Bluesim scratch (from manual bsc -sim runs)
+*.ba
+*.cxx
+sim.out
+sim.out.so
+model_*.h
+# Linux kernel module (driver) build
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+modules.order
+Module.symvers
+.*.cmd
+.tmp_versions/
 
 # CLion
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

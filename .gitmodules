@@ -1,0 +1,3 @@
+[submodule "control/vendor/bam"]
+	path = control/vendor/bam
+	url = https://github.com/ZaidQureshi/bam

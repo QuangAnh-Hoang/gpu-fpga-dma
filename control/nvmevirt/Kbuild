@@ -1,0 +1,55 @@
+# Select one of the targets to build
+#CONFIG_NVMEVIRT_NVM := y
+CONFIG_NVMEVIRT_SSD := y
+#CONFIG_NVMEVIRT_ZNS := y
+#CONFIG_NVMEVIRT_KV := y
+
+# GPU Direct I/O support (requires NVIDIA driver with nv-p2p.h)
+#
+# DISABLED for the ISE + GPU-FPGA-DMA integration: NVMeVirt is the control plane
+# only. The FPGA (via driver/fpga_gdr + the proprietary NVIDIA driver) owns the
+# GPU-memory data path, so NVMeVirt needs no nvidia_p2p/GPUDirect coupling and
+# stays a pure DRAM-backed NVMe controller. See docs/ise-dma-integration.md.
+#
+# To re-enable a NVMeVirt-native GPUDirect baseline, uncomment CONFIG_… below and
+# set NVIDIA_SRC_DIR to the tree containing nv-p2p.h (the proprietary driver's own
+# /usr/src/nvidia-<version>/nvidia works — its nvidia_p2p_* API is the same one
+# driver/fpga_gdr already uses).
+CONFIG_NVMEVIRT_GPU_DIRECT := y
+NVIDIA_SRC_DIR ?= /usr/src/nvidia-570.172.08/nvidia
+
+obj-m   := nvmev.o
+nvmev-objs := main.o pci.o admin.o io.o dma.o
+ccflags-y += -Wno-unused-variable -Wno-unused-function
+
+ccflags-$(CONFIG_NVMEVIRT_GPU_DIRECT) += -DCONFIG_NVMEVIRT_GPU_DIRECT
+ccflags-$(CONFIG_NVMEVIRT_GPU_DIRECT) += -I$(NVIDIA_SRC_DIR)
+KBUILD_EXTRA_SYMBOLS += $(if $(CONFIG_NVMEVIRT_GPU_DIRECT),$(NVIDIA_SRC_DIR)/../Module.symvers)
+nvmev-$(CONFIG_NVMEVIRT_GPU_DIRECT) += gpu_mem.o gpu_memcpy.o
+CFLAGS_gpu_memcpy.o += -mavx -msse4.1
+
+# FPGA-backed namespace forwarding (Milestone F): NVMeVirt forwards FPGA-namespace
+# reads to the userspace daemon over /dev/nvmev_fpga (FQ/FCQ ring). Pure ring +
+# mmap — NO nvidia_p2p, so it is independent of CONFIG_NVMEVIRT_GPU_DIRECT and
+# preserves the decoupling from the GPU driver.
+CONFIG_NVMEVIRT_FPGA := y
+ccflags-$(CONFIG_NVMEVIRT_FPGA) += -DCONFIG_NVMEVIRT_FPGA
+nvmev-$(CONFIG_NVMEVIRT_FPGA) += fpga_fwd.o
+
+# coalesce: CPU golden model of the near-storage page-keyed sort-reduce engine
+# (docs/nvmevirt-gnn-two-queue-model.md). Rides on the FPGA gather opcode/ABI.
+nvmev-$(CONFIG_NVMEVIRT_FPGA) += coalesce.o
+
+ccflags-$(CONFIG_NVMEVIRT_NVM) += -DBASE_SSD=INTEL_OPTANE
+nvmev-$(CONFIG_NVMEVIRT_NVM) += simple_ftl.o
+
+ccflags-$(CONFIG_NVMEVIRT_SSD) += -DBASE_SSD=SAMSUNG_970PRO
+nvmev-$(CONFIG_NVMEVIRT_SSD) += ssd.o conv_ftl.o pqueue/pqueue.o channel_model.o
+
+ccflags-$(CONFIG_NVMEVIRT_ZNS) += -DBASE_SSD=WD_ZN540
+#ccflags-$(CONFIG_NVMEVIRT_ZNS) += -DBASE_SSD=ZNS_PROTOTYPE
+ccflags-$(CONFIG_NVMEVIRT_ZNS) += -Wno-implicit-fallthrough
+nvmev-$(CONFIG_NVMEVIRT_ZNS) += ssd.o zns_ftl.o zns_read_write.o zns_mgmt_send.o zns_mgmt_recv.o channel_model.o
+
+ccflags-$(CONFIG_NVMEVIRT_KV) += -DBASE_SSD=KV_PROTOTYPE
+nvmev-$(CONFIG_NVMEVIRT_KV) += kv_ftl.o append_only.o bitmap.o

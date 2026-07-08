@@ -79,6 +79,15 @@ void __iomem *nvmev_gpu_kmap(u64 phys_addr);
 bool nvmev_is_gpu_addr(u64 phys_addr);
 
 /*
+ * Fill @out with the GPU-page physical/bus addresses covering
+ * [gpu_va, gpu_va+len) from the registered region containing gpu_va (up to
+ * @max entries; count in *@n_out). GPU pages are NVMEV_GPU_PAGE_SIZE (64 KB).
+ * Lets userspace resolve a per-row dst_phys without parsing /proc text.
+ * Returns 0, -ENOENT if gpu_va is not in a registered region.
+ */
+int nvmev_gpu_region_pages(u64 gpu_va, u64 len, u64 *out, u32 max, u32 *n_out);
+
+/*
  * Auto-map an MMIO physical address with ioremap_wc and cache the result.
  *
  * On first call for a given 256MB-aligned region, creates a persistent
@@ -109,6 +118,12 @@ static inline void __iomem *nvmev_gpu_kmap(u64 phys_addr)
 static inline bool nvmev_is_gpu_addr(u64 phys_addr)
 {
 	return false;
+}
+
+static inline int nvmev_gpu_region_pages(u64 gpu_va, u64 len, u64 *out,
+					 u32 max, u32 *n_out)
+{
+	return -ENODEV;
 }
 
 static inline void __iomem *nvmev_gpu_auto_map(u64 phys_addr)

@@ -483,9 +483,11 @@ enum nvme_admin_opcode {
 /* ISE (Intelligent Storage Emulator) vendor I/O opcodes (0xC0-0xFF) */
 enum nvme_ise_opcode {
 	ISE_OPC_MASK_READ = 0xC0,
-	ISE_OPC_FPGA_GATHER = 0xC1, /* forward read to FPGA daemon (Milestone F2):
-				     * cdw10[0]=first node id, cdw10[1]=n_rows,
-				     * prp1=GPU dest (fixed-window for now) */
+	ISE_OPC_FPGA_GATHER = 0xC1, /* RESERVED, handler retired (assessment DD2).
+				     * The FQ/FCQ daemon-forwarding path that consumed
+				     * this opcode moved to attic/fpga_fwd/; the middle
+				     * layer ingests gathers over /dev/nvmev_l1 instead.
+				     * Kept reserved so the opcode is never reused. */
 };
 
 enum {

@@ -6,15 +6,12 @@ CONFIG_NVMEVIRT_SSD := y
 
 # GPU Direct I/O support (requires NVIDIA driver with nv-p2p.h)
 #
-# DISABLED for the ISE + GPU-FPGA-DMA integration: NVMeVirt is the control plane
-# only. The FPGA (via driver/fpga_gdr + the proprietary NVIDIA driver) owns the
-# GPU-memory data path, so NVMeVirt needs no nvidia_p2p/GPUDirect coupling and
-# stays a pure DRAM-backed NVMe controller. See docs/ise-dma-integration.md.
-#
-# To re-enable a NVMeVirt-native GPUDirect baseline, uncomment CONFIG_… below and
-# set NVIDIA_SRC_DIR to the tree containing nv-p2p.h (the proprietary driver's own
-# /usr/src/nvidia-<version>/nvidia works — its nvidia_p2p_* API is the same one
-# driver/fpga_gdr already uses).
+# ENABLED: the middle-layer golden model delivers feature rows straight into GPU
+# VRAM (nvmev_memcpy_to_gpu against a gpu_mem-registered region), so it needs the
+# nvidia_p2p symbols. NVIDIA_SRC_DIR must point at the driver tree containing
+# nv-p2p.h (the proprietary/open driver's own /usr/src/nvidia-<version>/nvidia
+# works — its nvidia_p2p_* API is the same one driver/fpga_gdr uses). To build a
+# pure DRAM-backed controller with no GPU coupling, comment CONFIG_… below out.
 CONFIG_NVMEVIRT_GPU_DIRECT := y
 NVIDIA_SRC_DIR ?= /usr/src/nvidia-570.172.08/nvidia
 
@@ -28,17 +25,17 @@ KBUILD_EXTRA_SYMBOLS += $(if $(CONFIG_NVMEVIRT_GPU_DIRECT),$(NVIDIA_SRC_DIR)/../
 nvmev-$(CONFIG_NVMEVIRT_GPU_DIRECT) += gpu_mem.o gpu_memcpy.o
 CFLAGS_gpu_memcpy.o += -mavx -msse4.1
 
-# FPGA-backed namespace forwarding (Milestone F): NVMeVirt forwards FPGA-namespace
-# reads to the userspace daemon over /dev/nvmev_fpga (FQ/FCQ ring). Pure ring +
-# mmap — NO nvidia_p2p, so it is independent of CONFIG_NVMEVIRT_GPU_DIRECT and
-# preserves the decoupling from the GPU driver.
-CONFIG_NVMEVIRT_FPGA := y
-ccflags-$(CONFIG_NVMEVIRT_FPGA) += -DCONFIG_NVMEVIRT_FPGA
-nvmev-$(CONFIG_NVMEVIRT_FPGA) += fpga_fwd.o
-
-# coalesce: CPU golden model of the near-storage page-keyed sort-reduce engine
-# (docs/nvmevirt-gnn-two-queue-model.md). Rides on the FPGA gather opcode/ABI.
-nvmev-$(CONFIG_NVMEVIRT_FPGA) += coalesce.o
+# Middle layer: the software-defined computational-storage controller
+# (docs/middle-layer-assessment.md). L1-ring ingest + page-keyed sort-reduce
+# (coalesce) + swappable backend providers (co_backend_ops) delivering feature
+# rows P2P to VRAM. Replaces the retired FQ/FCQ daemon-forwarding path (DD2,
+# now attic/fpga_fwd/). Delivery needs CONFIG_NVMEVIRT_GPU_DIRECT.
+CONFIG_NVMEVIRT_MIDLAYER := y
+ccflags-$(CONFIG_NVMEVIRT_MIDLAYER) += -DCONFIG_NVMEVIRT_MIDLAYER
+# coalesce_backend.h is header-only; providers live in backend_model.o
+# (emulated DRAM), backend_nvme.o (real NVMe via the block layer), and
+# backend_direct.o (middle-layer-owned NVMe I/O QP, poll-mode; Stage A).
+nvmev-$(CONFIG_NVMEVIRT_MIDLAYER) += coalesce.o backend_model.o backend_nvme.o backend_direct.o
 
 ccflags-$(CONFIG_NVMEVIRT_NVM) += -DBASE_SSD=INTEL_OPTANE
 nvmev-$(CONFIG_NVMEVIRT_NVM) += simple_ftl.o

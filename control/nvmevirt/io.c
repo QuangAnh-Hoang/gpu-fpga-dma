@@ -12,7 +12,6 @@
 #include "dma.h"
 #include "gpu_mem.h"
 #include "gpu_memcpy.h"
-#include "fpga_fwd.h"
 
 #ifdef CONFIG_NVMEVIRT_GPU_DIRECT
 #include <asm/fpu/api.h>
@@ -692,20 +691,6 @@ static bool __fast_path_io(int sqid, int sq_entry_idx)
 }
 #endif
 
-#ifdef CONFIG_NVMEVIRT_FPGA
-/* FPGA-backed namespace forwarding (Milestone F2). fpga_nsid is 1-based; 0 =
- * plain-read forwarding off (the ISE_OPC_FPGA_GATHER vendor opcode always
- * forwards). fpga_row_bytes is the feature-row stride used to map LBA<->node. */
-static unsigned int fpga_nsid;
-module_param(fpga_nsid, uint, 0644);
-MODULE_PARM_DESC(fpga_nsid, "1-based nsid whose plain reads forward to the FPGA (0=off)");
-static unsigned int fpga_row_bytes = 512;
-module_param(fpga_row_bytes, uint, 0644);
-MODULE_PARM_DESC(fpga_row_bytes, "feature row size (bytes) for FPGA-backed reads");
-static void __fpga_complete(int sqid, int cqid, int sq_entry, int cmd_id,
-			    int status, unsigned int result0);
-#endif
-
 static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
@@ -733,52 +718,6 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 
 	if (unlikely(nsid >= nvmev_vdev->nr_ns))
 		return false;
-
-#ifdef CONFIG_NVMEVIRT_FPGA
-	/* FPGA-backed read: forward to the userspace daemon instead of serving
-	 * from the DRAM backing. The FPGA gathers the feature rows into GPU VRAM;
-	 * the command completes later when the daemon posts to the FCQ (drained in
-	 * the dispatcher loop). No DRAM->PRP memcpy, no nvidia_p2p. */
-	if (nvmev_fpga_ready()) {
-		u8 opc = cmd->common.opcode;
-		bool vendor = (opc == ISE_OPC_FPGA_GATHER);
-		bool fpga_rd = (opc == nvme_cmd_read) && fpga_nsid &&
-			       (nsid + 1 == fpga_nsid);
-		if (vendor || fpga_rd) {
-			u16 cqid = sq->cqid;
-			u16 cid = cmd->common.command_id;
-			u64 node_id, gpu_dst;
-			u32 n_rows;
-			int rc;
-
-			if (vendor) {
-				struct nvme_common_command *cc =
-					&sq_entry(sq_entry).common;
-				node_id = cc->cdw10[0];
-				n_rows = cc->cdw10[1] ? cc->cdw10[1] : 1;
-				gpu_dst = cc->prp1;
-			} else {
-				struct nvme_rw_command *rw = &sq_entry(sq_entry).rw;
-				u64 off = ((u64)rw->slba) << LBA_BITS;
-				u32 len = (rw->length + 1) << LBA_BITS;
-
-				node_id = fpga_row_bytes ? off / fpga_row_bytes : 0;
-				n_rows = fpga_row_bytes ? len / fpga_row_bytes : 1;
-				if (!n_rows)
-					n_rows = 1;
-				gpu_dst = rw->prp1;
-			}
-			*io_size = (size_t)n_rows * fpga_row_bytes;
-			rc = nvmev_fpga_forward(sqid, cqid, sq_entry, cid, node_id,
-						n_rows, fpga_row_bytes, gpu_dst,
-						vendor ? ISF_F_BATCH : 0);
-			if (rc) /* ring/table full: complete with error, never hang */
-				__fpga_complete(sqid, cqid, sq_entry, cid,
-						NVME_SC_INTERNAL, 0);
-			return true;
-		}
-	}
-#endif
 
 #ifdef CONFIG_NVMEVIRT_GPU_DIRECT
 	if (unlikely(nvmev_io_lat_ns)) {
@@ -955,49 +894,6 @@ static void __fill_cq_result(struct nvmev_io_work *w)
 		cq->interrupt_ready = true;
 	spin_unlock(&cq->entry_lock);
 }
-
-#ifdef CONFIG_NVMEVIRT_FPGA
-/* Post a CQ entry for a forwarded command and raise its interrupt directly
- * (forwarded reads bypass the io-worker that normally signals). */
-static void __fpga_complete(int sqid, int cqid, int sq_entry, int cmd_id,
-			    int status, unsigned int result0)
-{
-	struct nvmev_completion_queue *cq = nvmev_vdev->cqes[cqid];
-	struct nvmev_io_work w = {
-		.sqid = sqid,
-		.cqid = cqid,
-		.sq_entry = sq_entry,
-		.command_id = cmd_id,
-		.status = status,
-		.result0 = result0,
-		.result1 = 0,
-	};
-
-	__fill_cq_result(&w);
-	if (cq->irq_enabled)
-		nvmev_signal_irq(cq->irq_vector);
-	cq->interrupt_ready = false;
-}
-
-/* Milestone F4: drain the daemon's FCQ and post the matching NVMe completions.
- * Called from the dispatcher loop. Returns true if any command completed. */
-bool nvmev_fpga_complete_pending(void)
-{
-	struct ise_fwd_cqe c;
-	struct fpga_pend p;
-	bool did = false;
-
-	while (nvmev_fpga_fcq_pop(&c)) {
-		if (nvmev_fpga_pend_take(c.req_id, &p)) {
-			__fpga_complete(p.sqid, p.cqid, p.sq_entry, p.cmd_id,
-					c.status, c.offset);
-			did = true;
-		}
-	}
-	return did;
-}
-
-#endif
 
 /*
  * Worker fast-path: each worker polls doorbells for its assigned SQs,

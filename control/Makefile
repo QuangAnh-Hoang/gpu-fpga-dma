@@ -31,12 +31,33 @@ LIBNVM_CC  ?= /usr/bin/gcc-9
 # Default module parameters (64G reserved at physical address 64G)
 MEMMAP_START ?= 68719476736
 MEMMAP_SIZE  ?= 68719476736
-CPUS         ?= 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+
+# CPU allocation (DD4 — assessment §5.3). CPUS = dispatcher,io-worker,io-worker,...
+# Target layout requires whole-physical-core isolation via the kernel cmdline:
+#     isolcpus=8-15,24-31        (cores 8-15; sibling(k)=k+16, so 24-31 too)
+# then, one thread per PHYSICAL core (sibling idle => no SMT contention):
+#     dispatcher = 8 ; io-workers = 9,10,11 ; coalesce shards = 12,13,14,15
+#     (coalesce_cpu_base=12, coalesce_cores=4 — the module defaults)
+# Housekeeping + NVMe/bio IRQs stay on cores 0-7 (+ siblings 16-23). After load,
+# steer the backend SSDs' IRQs off the isolated cores, e.g.:
+#     for i in $(grep -l nvme /proc/irq/*/nvme* 2>/dev/null); do ...; done
+#     (or: echo <cpu0-7 mask> > /proc/irq/<nvme-irq>/smp_affinity)
+# For a BaM baseline run (coalesce disabled) you can widen io-workers to 9-15:
+#     sudo make reload CPUS=8,9,10,11,12,13,14,15
+CPUS         ?= 8,9,10,11
+
+# `reload-8shard` profile knobs: 8 coalesce shards on isolated cores 8-15, with
+# the (idle-in-L1) NVMe personality minimized to housekeeping cores. Override on
+# the command line, e.g.  sudo make reload-8shard BACKEND=pci:0000:62:00.0 DELIVER=1
+RING     ?= 262144        # per-shard ring/window ceiling (pow2)
+DELIVER  ?= 0             # 0 = CPU WC-store, 1 = GPU-pull (needs libisefs_gpupull)
+BACKEND  ?=               # coalesce_backend: pci:<BDF> (direct) | /dev/nvmeXn1 (bio) | empty=emulated
 
 # Timeout waiting for virtual PCI device to appear (seconds)
 PCI_WAIT_TIMEOUT ?= 5
 
-.PHONY: help build clean load unload reload status _check_root _check_ko \
+.PHONY: help build clean load unload reload reload-8shard status \
+        _check_root _check_ko \
         build-libnvm load-libnvm unload-libnvm reload-libnvm
 
 help:
@@ -46,6 +67,8 @@ help:
 	@echo "  sudo make load      — Load nvmev.ko"
 	@echo "  sudo make unload    — Unload nvmev.ko"
 	@echo "  sudo make reload    — Unload then load"
+	@echo "  sudo make reload-8shard [BACKEND=pci:<BDF>|/dev/nvmeXn1] [DELIVER=0|1] [RING=262144]"
+	@echo "                      — 8 shards on isolated cores 8-15 (NVMe personality on 0-1)"
 	@echo "  sudo make status    — Show module/device status"
 	@echo ""
 	@echo "  make build-libnvm   — Build libnvm/BaM (from $(LIBNVM_DIR))"
@@ -126,11 +149,11 @@ load: _check_root _check_ko
 	@if lsmod | grep -q '^nvmev '; then \
 		echo "[SKIP] nvmev already loaded"; \
 	else \
-		echo "[LOAD] insmod nvmev.ko (memmap_start=$(MEMMAP_START), memmap_size=$(MEMMAP_SIZE))"; \
+		echo "[LOAD] insmod nvmev.ko (memmap_start=$(MEMMAP_START), memmap_size=$(MEMMAP_SIZE)) $(EXTRA_PARAMS)"; \
 		insmod $(NVMEV_KO) \
 			memmap_start=$(MEMMAP_START) \
 			memmap_size=$(MEMMAP_SIZE) \
-			cpus=$(CPUS); \
+			cpus=$(CPUS) $(EXTRA_PARAMS); \
 		echo "[OK]   nvmev loaded"; \
 	fi
 	@# ── Step 2: Wait for virtual PCI device ────────────────────────
@@ -168,6 +191,21 @@ reload: _check_root
 	@echo ""
 	@sleep 1
 	@$(MAKE) --no-print-directory load
+
+# 8-shard coalesce profile: shards on the 8 isolated physical cores 8-15 (split
+# reapers use SMT siblings 24-31), NVMe personality minimized to housekeeping
+# cores 0-1 so it doesn't collide with the shards. Scales CPU (sort/scatter/
+# deliver) AND backend NVMe I/O queues (backend_direct makes one QP/shard) — best
+# paired with multi-SSD striping. Requires isolcpus=8-15,24-31 (DD4). Report the
+# cores consumed (assessment §4.4) — the FPGA's claim is removing them.
+#   sudo make reload-8shard BACKEND=pci:0000:62:00.0 DELIVER=1
+reload-8shard: _check_root
+	@echo "=== 8-shard profile: shards 8-15, NVMe personality on 0-1, ring=$(RING) ==="
+	@$(MAKE) --no-print-directory reload \
+		CPUS=0,1 \
+		EXTRA_PARAMS="coalesce_cores=8 coalesce_cpu_base=8 coalesce_enable=1 \
+			coalesce_ring=$(RING) coalesce_deliver=$(DELIVER) \
+			$(if $(BACKEND),coalesce_backend=$(BACKEND),) $(EXTRA_PARAMS)"
 
 status:
 	@echo "=== Module Status ==="

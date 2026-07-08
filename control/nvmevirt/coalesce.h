@@ -25,10 +25,77 @@
 #ifndef NVMEV_COALESCE_H
 #define NVMEV_COALESCE_H
 
-#ifdef CONFIG_NVMEVIRT_FPGA
+#ifdef CONFIG_NVMEVIRT_MIDLAYER
 #include <linux/types.h>
+#include <linux/ioctl.h>
 
 struct proc_dir_entry;
+
+/* VA->dst_phys translate ioctl on /dev/nvmev_l1 (M6). Given a registered VRAM
+ * range, returns its GPU-page bus addresses so userspace (libisefs) can resolve
+ * each feature row's dst_phys without parsing /proc/nvmev/gpu_mem. Mirrored in
+ * sw/nvmev_l1.h. */
+struct l1_translate {
+	__u64 gpu_va;	/* in: start of the registered VRAM range          */
+	__u64 len;	/* in: byte length                                 */
+	__u64 phys;	/* in: user ptr to __u64[n_pages] (out: bus addrs) */
+	__u32 n_pages;	/* in: capacity / out: pages written               */
+	__u32 page_shift;/* out: GPU page shift (16 => 64 KB)              */
+};
+#define NVMEV_L1_IOC_TRANSLATE _IOWR('L', 1, struct l1_translate)
+
+/* GPU-pull staging geometry (b2). The kernel exposes one contiguous, page-
+ * granular staging region (all shards) at mmap file offset NVMEV_L1_MMAP_STAGING
+ * so userspace can mmap + cudaHostRegister it once and the GPU-pull kernel can
+ * read any feature row by a single byte offset. A row for (shard, slot) lives at
+ * ((shard*pend_cap)+slot)*page; descriptors (b3) carry the absolute offset. */
+struct l1_staging {
+	__u64 mmap_off;		/* out: mmap() file offset of the staging region */
+	__u64 bytes;		/* out: total region size                        */
+	__u32 nshards;		/* out: shard count                              */
+	__u32 pend_cap;		/* out: staging slots per shard                  */
+	__u32 page;		/* out: staging page (bytes)                     */
+	__u32 _pad;
+};
+#define NVMEV_L1_IOC_STGINFO _IOR('L', 2, struct l1_staging)
+
+/* GPU-pull descriptor ring (b3). In gpu-pull delivery (coalesce_deliver=1) the
+ * kernel does NOT WC-store rows or post CQEs; per finished row it enqueues one
+ * gather descriptor here, and the GPU persistent kernel (b4) reads the row from
+ * staging into VRAM and writes the l1_cqe itself. Per-shard SPSC ring (kernel
+ * produces `head`, GPU consumes `tail`), mirror of the L1 ring layout. */
+struct l1_gdesc {		/* one gather descriptor (32 B) */
+	__u64 staging_off;	/* src: byte offset into the staging region      */
+	__u64 dst;		/* dst: l1_req.dst_phys passthrough (GPU interprets) */
+	__u32 req_id;		/* -> l1_cqe.req_id the GPU posts                */
+	__u16 len;		/* = coalesce_row                                */
+	__u16 status;		/* 0 = gather+deliver; !=0 = error (cqe only)    */
+	__u64 _pad;
+};
+struct l1_gring {		/* per-shard descriptor-ring header (in g_desc) */
+	__u32 magic;
+	__u32 entries;		/* ring capacity (power of two)                  */
+	__u32 desc_off;		/* byte offset (within this shard slice) to l1_gdesc[] */
+	__u32 shard;
+	__u32 head;		/* producer cursor (kernel)                      */
+	__u32 tail;		/* consumer cursor (GPU) — flow control          */
+	__u32 shard_bytes;	/* per-shard slice size                          */
+	__u32 _pad;
+};
+struct l1_descinfo {		/* DESCINFO ioctl */
+	__u64 mmap_off;		/* out: mmap() file offset of the descriptor region */
+	__u64 bytes;		/* out: total region size                        */
+	__u32 nshards;		/* out                                           */
+	__u32 entries;		/* out: per-shard ring capacity                  */
+	__u32 shard_bytes;	/* out: per-shard slice size                     */
+	__u32 _pad;
+};
+#define NVMEV_L1_IOC_DESCINFO _IOR('L', 3, struct l1_descinfo)
+
+/* mmap file offsets selecting each GPU-accessible region (0 = the L1 rings). */
+#define NVMEV_L1_MMAP_STAGING (1ULL << 34)
+#define NVMEV_L1_MMAP_DESC    (2ULL << 34)
+#define NVMEV_L1_GRING_MAGIC  0x4e4c3147u /* 'NL1G' */
 
 #define NVMEV_L1_MAGIC   0x4e4c3151u /* 'NL1Q' */
 #define NVMEV_L1_VERSION 1u
@@ -78,13 +145,19 @@ struct l1_ring {
 	__u32 cq_tail __attribute__((aligned(64))); /* consumer: GPU            */
 };
 
-/* Per-flush grouping algorithm (swept to measure sorter cost / ordering). */
-enum co_sort { CO_SORT_RADIX = 0, CO_SORT_COMPARISON = 1, CO_SORT_HASH = 2 };
+/* Per-flush grouping algorithm (swept to measure sorter cost / ordering).
+ * RADIX/COMPARISON/HASH are exact global window dedup (the upper-bound
+ * reference). BUCKET is the two-stage RTL oracle (BLRadix online bucketer +
+ * bounded per-burst MergeSortReducer): online binning, arrival-adjacent
+ * pre-filter, half-capacity burst eviction, dedup bounded to one burst — a
+ * weaker, arrival-order-dependent coalescer that matches the hardware. */
+enum co_sort { CO_SORT_RADIX = 0, CO_SORT_COMPARISON = 1, CO_SORT_HASH = 2,
+	       CO_SORT_BUCKET = 3 };
 
 /* Lifecycle, called from NVMEV_STORAGE_INIT / _FINAL in main.c. Spawns the
  * consumer cores, allocates the ring region + /dev/nvmev_l1, and /proc counters. */
 int nvmev_coalesce_init(struct proc_dir_entry *proc_root);
 void nvmev_coalesce_exit(struct proc_dir_entry *proc_root);
 
-#endif /* CONFIG_NVMEVIRT_FPGA */
+#endif /* CONFIG_NVMEVIRT_MIDLAYER */
 #endif /* NVMEV_COALESCE_H */

@@ -211,6 +211,40 @@ bool nvmev_is_gpu_addr(u64 phys_addr)
 	return idx >= 0;
 }
 
+int nvmev_gpu_region_pages(u64 gpu_va, u64 len, u64 *out, u32 max, u32 *n_out)
+{
+	struct nvmev_gpu_region *region;
+	int ret = -ENOENT;
+
+	mutex_lock(&gpu_mgr.lock);
+	list_for_each_entry(region, &gpu_mgr.regions, list) {
+		u64 aligned_va;
+		u32 start_pg, npg, i;
+
+		if (!region->valid)
+			continue;
+		if (gpu_va < region->gpu_va ||
+		    gpu_va >= region->gpu_va + region->size)
+			continue;
+
+		aligned_va = gpu_va & NVMEV_GPU_PAGE_MASK;
+		start_pg = (u32)((aligned_va - region->gpu_va) >> NVMEV_GPU_PAGE_SHIFT);
+		npg = (u32)DIV_ROUND_UP((gpu_va - aligned_va) + len,
+					NVMEV_GPU_PAGE_SIZE);
+		if (start_pg + npg > region->nr_pages)
+			npg = region->nr_pages - start_pg;
+		if (npg > max)
+			npg = max;
+		for (i = 0; i < npg; i++)
+			out[i] = region->pages[start_pg + i].phys_addr;
+		*n_out = npg;
+		ret = 0;
+		break;
+	}
+	mutex_unlock(&gpu_mgr.lock);
+	return ret;
+}
+
 int nvmev_gpu_mem_register(u64 gpu_va, u64 size)
 {
 	struct nvmev_gpu_region *region;

@@ -24,7 +24,6 @@
 #include "kv_ftl.h"
 #include "dma.h"
 #include "gpu_mem.h"
-#include "fpga_fwd.h"
 #include "coalesce.h"
 
 /****************************************************************
@@ -192,11 +191,6 @@ static int nvmev_dispatcher(void *data)
 			last_dispatched_time = jiffies;
 		if (nvmev_proc_dbs())
 			last_dispatched_time = jiffies;
-
-#ifdef CONFIG_NVMEVIRT_FPGA
-		if (nvmev_fpga_complete_pending()) /* F4: FCQ -> NVMe CQ */
-			last_dispatched_time = jiffies;
-#endif
 
 		if (CONFIG_NVMEVIRT_IDLE_TIMEOUT != 0 &&
 		    time_after(jiffies, last_dispatched_time + (CONFIG_NVMEVIRT_IDLE_TIMEOUT * HZ)))
@@ -523,7 +517,7 @@ static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_debug = proc_create("debug", 0444, nvmev_vdev->proc_root, &proc_file_fops);
 	proc_create("io_lat_ns", 0664, nvmev_vdev->proc_root, &io_lat_ns_fops);
-#ifdef CONFIG_NVMEVIRT_FPGA
+#ifdef CONFIG_NVMEVIRT_MIDLAYER
 	nvmev_coalesce_init(nvmev_vdev->proc_root);
 #endif
 }
@@ -536,7 +530,7 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 	remove_proc_entry("stat", nvmev_vdev->proc_root);
 	remove_proc_entry("debug", nvmev_vdev->proc_root);
 	remove_proc_entry("io_lat_ns", nvmev_vdev->proc_root);
-#ifdef CONFIG_NVMEVIRT_FPGA
+#ifdef CONFIG_NVMEVIRT_MIDLAYER
 	nvmev_coalesce_exit(nvmev_vdev->proc_root);
 #endif
 
@@ -729,11 +723,6 @@ static int NVMeV_init(void)
 
 	pci_bus_add_devices(nvmev_vdev->virt_bus);
 
-#ifdef CONFIG_NVMEVIRT_FPGA
-	if (nvmev_fpga_init(1u << 15, 1u << 15) < 0)
-		NVMEV_ERROR("nvmev_fpga: ring init failed (FPGA forwarding disabled)\n");
-#endif
-
 	NVMEV_INFO("Virtual NVMe device created\n");
 
 	return 0;
@@ -760,10 +749,6 @@ static void NVMeV_exit(void)
 #ifdef CONFIG_NVMEVIRT_GPU_DIRECT
 	nvmev_gpu_procfs_exit(nvmev_vdev->proc_root);
 	nvmev_gpu_mem_exit();
-#endif
-
-#ifdef CONFIG_NVMEVIRT_FPGA
-	nvmev_fpga_exit();
 #endif
 
 	NVMEV_STORAGE_FINAL(nvmev_vdev);
